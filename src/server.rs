@@ -1,50 +1,60 @@
+use crate::{chat_message::ChatMessage, hub::Hub};
 use futures_util::{SinkExt, StreamExt};
 use log::info;
-use tokio::net::TcpStream;
+use std::error::Error;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 use uuid::Uuid;
 
-use crate::error::DynError;
-use crate::message::MessageHandler;
-use crate::message_hub::MessageHub;
+pub async fn run(addr: &str, hub: impl Hub + 'static) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let listener = TcpListener::bind(addr).await?;
+    info!("WebSocket server listening on ws://{}", addr);
 
-pub async fn handle_connection(stream: TcpStream, msg_hub: MessageHub) -> Result<(), DynError> {
+    while let Ok((stream, _)) = listener.accept().await {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, hub).await {
+                info!("Connection error: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(stream: TcpStream, hub: impl Hub + 'static) -> Result<(), Box<dyn Error + Send + Sync>> {
     let peer_addr = stream.peer_addr()?;
     let client_id = Uuid::new_v4();
 
     info!("New connection from {} assigned id {}", peer_addr, client_id);
 
     let ws_stream = accept_async(stream).await?;
-
     let (tx, rx) = mpsc::channel::<Message>(100);
 
-    msg_hub.subscribe(client_id, tx).await;
+    hub.register(client_id, tx).await;
 
     let (mut ws_writer, ws_reader) = ws_stream.split();
 
     let welcome_message = Message::Text(format!("Welcome! your id: {}", client_id).into());
     ws_writer.send(welcome_message).await?;
 
-    let write_handle = spawn_ws_write_task(ws_writer, rx, client_id);
-    let read_handle = spawn_ws_read_task(ws_reader, client_id, msg_hub.clone());
+    let hub_clone = hub.clone();
+    let write_handle = spawn_write_task(ws_writer, rx, client_id);
+    let read_handle = spawn_read_task(ws_reader, client_id, hub_clone);
 
     tokio::select! {
-        _ = write_handle => {
-            info!("Write task finished first for {}", client_id);
-        }
-        _ = read_handle => {
-            info!("Read task finished first for {}", client_id);
-        }
+        _ = write_handle => { info!("Write task finished first for {}", client_id); }
+        _ = read_handle => { info!("Read task finished first for {}", client_id); }
     }
-    msg_hub.unsubscribe(client_id).await;
 
+    hub.unregister(client_id).await;
     info!("Connection {} ({}) closed", client_id, peer_addr);
 
     Ok(())
 }
 
-fn spawn_ws_write_task(
+fn spawn_write_task(
     mut write: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
     mut rx: mpsc::Receiver<Message>,
     client_id: Uuid,
@@ -60,18 +70,16 @@ fn spawn_ws_write_task(
     })
 }
 
-fn spawn_ws_read_task(
+fn spawn_read_task<H: Hub + 'static>(
     mut read: futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
     client_id: Uuid,
-    msg_hub: MessageHub,
+    hub: H,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let handler = MessageHandler::new(msg_hub);
-
         while let Some(result) = read.next().await {
             match result {
                 Ok(Message::Text(text)) => {
-                    if let Err(e) = handler.handle_text_message(client_id, text.to_string()).await {
+                    if let Err(e) = handle_message(client_id, &text, &hub).await {
                         info!("Message handling error for client {}: {}", client_id, e);
                     }
                 }
@@ -90,4 +98,11 @@ fn spawn_ws_read_task(
         }
         info!("Read task ended for client {}", client_id);
     })
+}
+
+async fn handle_message<H: Hub>(sender_id: Uuid, text: &str, hub: &H) -> Result<(), Box<dyn Error>> {
+    let msg = ChatMessage::parse(text)?;
+    let receiver_id = msg.receiver_uuid()?;
+    hub.send_to(sender_id, receiver_id, msg.text).await;
+    Ok(())
 }
