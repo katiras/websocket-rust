@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct ChatMessage {
@@ -12,7 +11,7 @@ impl ChatMessage {
         serde_json::from_str(text)
     }
 
-    pub fn receiver_uuid(&self) -> Result<Uuid, uuid::Error> {
-        Uuid::parse_str(&self.receiver_id)
+    pub fn receiver_username(&self) -> String {
+        self.receiver_id.clone()
     }
 }

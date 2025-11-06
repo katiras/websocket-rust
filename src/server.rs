@@ -5,7 +5,6 @@ use std::error::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
-use uuid::Uuid;
 
 pub async fn run(addr: &str, hub: impl Hub + 'static) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
@@ -25,84 +24,113 @@ pub async fn run(addr: &str, hub: impl Hub + 'static) -> Result<(), Box<dyn Erro
 
 async fn handle_connection(stream: TcpStream, hub: impl Hub + 'static) -> Result<(), Box<dyn Error + Send + Sync>> {
     let peer_addr = stream.peer_addr()?;
-    let client_id = Uuid::new_v4();
 
-    info!("New connection from {} assigned id {}", peer_addr, client_id);
+    let (mut ws_writer, mut ws_reader) = accept_async(stream).await?.split();
 
-    let ws_stream = accept_async(stream).await?;
     let (tx, rx) = mpsc::channel::<Message>(100);
 
-    hub.register(client_id, tx).await;
+    let first_msg = match ws_reader.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => {
+            info!("Client {} did not send text as first message", peer_addr);
+            return Err("first_msg".into());
+        }
+    };
 
-    let (mut ws_writer, ws_reader) = ws_stream.split();
+    let username = validate_connect_message(&first_msg).await?;
+    let client_ids = hub.get_client_ids().await;
 
-    let welcome_message = Message::Text(format!("Welcome! your id: {}", client_id).into());
+    hub.register(username.clone(), tx).await;
+
+    let message = serde_json::json!({
+        "type": "userList",
+        "users": client_ids
+    });
+    let msg = Message::Text(message.to_string().into());
+    let _ = ws_writer.send(msg).await;
+
+    info!("Client {} connected as {}", peer_addr, username);
+
+    let welcome_message = Message::Text(format!("Welcome! your id: {}", username).into());
     ws_writer.send(welcome_message).await?;
 
     let hub_clone = hub.clone();
-    let write_handle = spawn_write_task(ws_writer, rx, client_id);
-    let read_handle = spawn_read_task(ws_reader, client_id, hub_clone);
+    let write_handle = spawn_write_task(ws_writer, rx, username.clone());
+    let read_handle = spawn_read_task(ws_reader, username.clone(), hub_clone);
 
-    tokio::select! {
-        _ = write_handle => { info!("Write task finished first for {}", client_id); }
-        _ = read_handle => { info!("Read task finished first for {}", client_id); }
-    }
+    let _ = tokio::try_join!(write_handle, read_handle);
 
-    hub.unregister(client_id).await;
-    info!("Connection {} ({}) closed", client_id, peer_addr);
+    hub.unregister(username.clone()).await;
+    info!("Connection {} ({}) closed", username, peer_addr);
 
     Ok(())
 }
 
 fn spawn_write_task(
-    mut write: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
+    mut write_ws_stream: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
     mut rx: mpsc::Receiver<Message>,
-    client_id: Uuid,
+    username: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = write.send(msg).await {
-                info!("Write error for client {}: {}", client_id, e);
+            if let Err(e) = write_ws_stream.send(msg).await {
+                info!("Write error for client {}: {}", username, e);
                 break;
             }
         }
-        info!("Write task ended for client {}", client_id);
+        info!("Write task ended for client {}", username);
     })
 }
 
 fn spawn_read_task<H: Hub + 'static>(
-    mut read: futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
-    client_id: Uuid,
+    mut read_ws_stream: futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
+    client_id: String,
     hub: H,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(result) = read.next().await {
+        while let Some(result) = read_ws_stream.next().await {
             match result {
                 Ok(Message::Text(text)) => {
-                    if let Err(e) = handle_message(client_id, &text, &hub).await {
-                        info!("Message handling error for client {}: {}", client_id, e);
+                    if let Err(e) = handle_message(client_id.clone(), &text, &hub).await {
+                        info!("Message error for {}: {}", client_id, e);
                     }
                 }
                 Ok(Message::Close(_)) => {
-                    info!("Client {} sent close frame", client_id);
+                    hub.unregister(client_id.clone()).await;
                     break;
-                }
-                Ok(_) => {
-                    info!("Received non-text message from {}", client_id);
                 }
                 Err(e) => {
-                    info!("Read error for client {}: {}", client_id, e);
+                    info!("Read error for {}: {}", client_id, e);
                     break;
                 }
+                _ => {}
             }
         }
-        info!("Read task ended for client {}", client_id);
+        info!("Read task ended for {}", client_id);
     })
 }
 
-async fn handle_message<H: Hub>(sender_id: Uuid, text: &str, hub: &H) -> Result<(), Box<dyn Error>> {
+async fn validate_connect_message(msg: &str) -> Result<String, String> {
+    let json = serde_json::from_str::<serde_json::Value>(msg).map_err(|e| format!("Invalid JSON: {}", e))?;
+
+    if json.get("type").and_then(|t| t.as_str()) != Some("connect") {
+        return Err("First message must be type 'connect'".to_string());
+    }
+
+    let username = json
+        .get("username")
+        .and_then(|u| u.as_str())
+        .ok_or("Missing username")?
+        .to_string();
+
+    info!("Username: {}", username);
+
+    Ok(username)
+}
+
+async fn handle_message<H: Hub>(sender_id: String, text: &str, hub: &H) -> Result<(), Box<dyn Error>> {
     let msg = ChatMessage::parse(text)?;
-    let receiver_id = msg.receiver_uuid()?;
+    let receiver_id = msg.receiver_username();
     hub.send_to(sender_id, receiver_id, msg.text).await;
     Ok(())
 }
