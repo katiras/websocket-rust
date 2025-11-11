@@ -1,13 +1,15 @@
 use crate::dispatcher::{ClientId, Dispatcher, DispatcherMessage};
 use futures_util::{SinkExt, StreamExt};
-use log::{LevelFilter, error};
+use log::{LevelFilter, error, info};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, net::SocketAddr};
 use tokio::{
     net::{TcpListener, TcpStream},
+    signal,
     sync::{mpsc, oneshot},
 };
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 mod dispatcher;
 
 #[derive(Deserialize, Serialize)]
@@ -61,23 +63,47 @@ const LISTEN_ADDR: &str = "127.0.0.1:8080";
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     env_logger::Builder::from_default_env().filter_level(LOGLEVEL).init();
 
+    let ct = CancellationToken::new();
+
+    let ct_clone = ct.clone();
+    tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                println!("Received Ctrl+C, shutting down...");
+                ct_clone.cancel();
+            }
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
+    });
+
     let (disp_tx, disp_rx) = mpsc::channel(DISPATCHER_CHANNEL_BUFFER_SIZE);
 
-    tokio::spawn(Dispatcher::new(disp_rx).run());
+    tokio::spawn(Dispatcher::new(disp_rx).run(ct.clone()));
 
     let listener = TcpListener::bind(LISTEN_ADDR).await?;
 
-    while let Ok((tcp_stream, addr)) = listener.accept().await {
-        let disp_tx = disp_tx.clone();
-        tokio::spawn(async move {
-            match accept_async(tcp_stream).await {
-                Ok(ws_stream) => match handle_connection(ws_stream, disp_tx.clone(), addr).await {
-                    Err(e) => error!("{}", e),
-                    Ok(_) => {}
-                },
-                Err(e) => error!("WebSocket handshake failed for client {}: {}", addr, e),
+    loop {
+        tokio::select! {
+            Ok((tcp_stream, addr)) = listener.accept() => {
+                let disp_tx = disp_tx.clone();
+                tokio::spawn(async move {
+                    match accept_async(tcp_stream).await {
+                        Ok(ws_stream) => {
+                            if let Err(e) = handle_connection(ws_stream, disp_tx, addr).await {
+                                error!("{}", e);
+                            }
+                        }
+                        Err(e) => error!("WebSocket handshake failed for client {}: {}", addr, e),
+                    }
+                });
             }
-        });
+            _ = ct.cancelled() => {
+                info!("Shutdown signal received, stopping accepting new connections");
+                break;
+            }
+        }
     }
 
     Ok(())
@@ -100,8 +126,7 @@ async fn handle_connection(
 
     let client_id = match serde_json::from_str::<IncomingMessage>(&first_msg) {
         Ok(IncomingMessage::Connect(data)) => data.username,
-        Ok(_) => return Err("Invalid first msg".into()),
-        Err(_) => return Err("Invalid first msg".into()),
+        _ => return Err("Invalid first msg".into())
     };
 
     // Register
@@ -111,9 +136,9 @@ async fn handle_connection(
         tx: cl_sender,
         res_chan: res_chan_tx,
     };
-    
+
     disp_tx.send(register_msg).await?;
-    
+
     res_chan_rx.await.unwrap()?;
 
     let dispatcher_tx_clone = disp_tx.clone();
