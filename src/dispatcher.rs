@@ -50,6 +50,7 @@ impl Dispatcher {
                 DispatcherMessage::Unregister { id } => {
                     self.clients.remove(&id);
                     self.broadcast_user_list();
+                    info!("Client {} unregistered", id)
                 }
                 DispatcherMessage::DirectMessage { from, to, text } => match self.clients.get(&to) {
                     Some(tx) => {

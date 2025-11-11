@@ -60,7 +60,7 @@ const LISTEN_ADDR: &str = "127.0.0.1:8080";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     env_logger::Builder::from_default_env().filter_level(LOGLEVEL).init();
-    
+
     let (disp_tx, disp_rx) = mpsc::channel(DISPATCHER_CHANNEL_BUFFER_SIZE);
 
     tokio::spawn(Dispatcher::new(disp_rx).run());
@@ -176,17 +176,15 @@ async fn handle_connection(
     tokio::select! {
         _ = &mut send_task => {
             recv_task.abort();
+            let _ = recv_task.await;
         },
         _ = &mut recv_task => {
             send_task.abort();
+            let _ = send_task.await;
         },
     }
 
-    let _ = send_task.await;
-    let _ = recv_task.await;
-
-    let unregister_msg = DispatcherMessage::Unregister { id: client_id };
-
+    let unregister_msg = DispatcherMessage::Unregister { id: client_id.clone() };
     dispatcher_tx_clone.send(unregister_msg).await.unwrap();
 
     Ok(())
