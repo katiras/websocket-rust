@@ -105,17 +105,16 @@ async fn handle_connection(
     };
 
     // Register
-    let (response_tx, response_rx) = oneshot::channel();
+    let (res_chan_tx, res_chan_rx) = oneshot::channel();
     let register_msg = DispatcherMessage::Register {
         id: client_id.clone(),
         tx: cl_sender,
-        response: response_tx,
+        res_chan: res_chan_tx,
     };
-    disp_tx.send(register_msg).await.unwrap();
-
-    if !response_rx.await.unwrap_or(false) {
-        return Err("Failed to register".into());
-    }
+    
+    disp_tx.send(register_msg).await?;
+    
+    res_chan_rx.await.unwrap()?;
 
     let dispatcher_tx_clone = disp_tx.clone();
 

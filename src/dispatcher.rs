@@ -1,5 +1,5 @@
 use log::{error, info};
-use std::collections::HashMap;
+use std::{collections::HashMap, error::Error};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ClientMessage;
@@ -10,7 +10,7 @@ pub enum DispatcherMessage {
     Register {
         id: ClientId,
         tx: mpsc::Sender<ClientMessage>,
-        response: oneshot::Sender<bool>,
+        res_chan: oneshot::Sender<Result<(), Box<dyn Error + Send + Sync>>>,
     },
     Unregister {
         id: ClientId,
@@ -38,14 +38,18 @@ impl Dispatcher {
     pub async fn run(mut self) {
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                DispatcherMessage::Register { id, tx, response } => {
-                    let success = !self.clients.contains_key(&id);
-                    if success {
-                        self.clients.insert(id.clone(), tx);
-                        self.broadcast_user_list();
-                        info!("Client {} registered", id)
-                    }
-                    let _ = response.send(success);
+                DispatcherMessage::Register { id, tx, res_chan } => {
+                    let result = match self.clients.contains_key(&id) {
+                        true => Err(format!("Client id {} already exists", id).into()),
+                        false => {
+                            self.clients.insert(id.clone(), tx);
+                            self.broadcast_user_list();
+                            info!("Client {} registered", id);
+                            Ok(())
+                        }
+                    };
+
+                    let _ = res_chan.send(result);
                 }
                 DispatcherMessage::Unregister { id } => {
                     self.clients.remove(&id);
