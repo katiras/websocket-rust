@@ -40,13 +40,25 @@ impl Dispatcher {
         loop {
             tokio::select! {
                 Some(msg) = self.rx.recv() => {
-                    self.handle(msg).await;  // Runs to completion
+                    self.handle(msg).await;
                 },
                 _ = ct.cancelled() => {
                     break;
                 }
             }
         }
+
+        self.rx.close();
+        while let Some(msg) = self.rx.recv().await {
+            self.handle(msg).await;
+        }
+
+        for (id, tx) in &self.clients {
+            let _ = tx.send(ClientMessage::Shutdown).await;
+            info!("Sent shutdown notification to client {}", id);
+        }
+
+        self.clients.clear();
     }
 
     async fn handle(&mut self, msg: DispatcherMessage) {
