@@ -1,7 +1,7 @@
-use log::{error, info};
 use std::{collections::HashMap, error::Error};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use crate::ClientMessage;
 
@@ -53,12 +53,14 @@ impl Dispatcher {
             self.handle(msg).await;
         }
 
-        for (id, tx) in &self.clients {
+        for (id, tx) in self.clients.drain() {
+            info!("Client {} unregistered", id);
             let _ = tx.send(ClientMessage::Shutdown).await;
-            info!("Sent shutdown notification to client {}", id);
         }
 
-        self.clients.clear();
+        // FOR BETTER PERFORMANCE
+        // self.clients.clear();
+        // info!("All clients unregistered")
     }
 
     async fn handle(&mut self, msg: DispatcherMessage) {
@@ -77,9 +79,13 @@ impl Dispatcher {
                 let _ = res_chan.send(result);
             }
             DispatcherMessage::Unregister { id } => {
-                self.clients.remove(&id);
-                self.broadcast_user_list();
-                info!("Client {} unregistered", id)
+                match self.clients.remove(&id) {
+                    Some(_) => {
+                        self.broadcast_user_list();
+                        info!("Client {} unregistered", id)
+                    }
+                    None => {},
+                };
             }
             DispatcherMessage::DirectMessage { from, to, text } => match self.clients.get(&to) {
                 Some(tx) => {
@@ -100,12 +106,7 @@ impl Dispatcher {
 
     fn broadcast_user_list(&self) {
         for (client_id, tx) in &self.clients {
-            let all_other_client_ids = self
-                .clients
-                .keys()
-                .filter(|k| *k != client_id)
-                .cloned()
-                .collect::<Vec<ClientId>>();
+            let all_other_client_ids = self.clients.keys().filter(|k| *k != client_id).cloned().collect::<Vec<ClientId>>();
 
             let cl_msg = ClientMessage::UserList {
                 users: all_other_client_ids,

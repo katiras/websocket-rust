@@ -1,8 +1,14 @@
 use crate::dispatcher::{ClientId, Dispatcher, DispatcherMessage};
-use futures_util::{SinkExt, StreamExt};
-use log::{LevelFilter, error, info};
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, net::SocketAddr};
+use std::{
+    error::Error,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal,
@@ -10,7 +16,14 @@ use tokio::{
 };
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::{error, info};
 mod dispatcher;
+
+const TRACING_LEVEL: tracing::Level = tracing::Level::INFO;
+const DISPATCHER_CHANNEL_BUFFER_SIZE: usize = 100;
+const CLIENT_CHANNEL_CAPACITY: usize = 32;
+const IP: &str = "127.0.0.1";
+const PORT: u16 = 8080;
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -56,14 +69,9 @@ enum ClientMessage {
     Shutdown,
 }
 
-const LOGLEVEL: LevelFilter = LevelFilter::Info;
-const DISPATCHER_CHANNEL_BUFFER_SIZE: usize = 100;
-const CLIENT_CHANNEL_CAPACITY: usize = 32;
-const LISTEN_ADDR: &str = "127.0.0.1:8080";
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    env_logger::Builder::from_default_env().filter_level(LOGLEVEL).init();
+    tracing_subscriber::fmt().with_max_level(TRACING_LEVEL).init();
 
     let ct = CancellationToken::new();
 
@@ -71,11 +79,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tokio::spawn(async move {
         match signal::ctrl_c().await {
             Ok(()) => {
-                println!("Received Ctrl+C, shutting down...");
+                info!("Shutting down...");
                 ct_clone.cancel();
             }
             Err(err) => {
-                eprintln!("Unable to listen for shutdown signal: {}", err);
+                error!("Unable to listen for shutdown signal: {}", err);
             }
         }
     });
@@ -84,7 +92,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     tokio::spawn(Dispatcher::new(disp_rx).run(ct.clone()));
 
-    let listener = TcpListener::bind(LISTEN_ADDR).await?;
+    let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from_str(IP)?), PORT);
+    let listener = TcpListener::bind(socket_addr).await?;
+    info!("Listening on {}:{}", IP, PORT);
     let connection_tasks_tracker = TaskTracker::new();
 
     loop {
@@ -103,7 +113,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 });
             }
             _ = ct.cancelled() => {
-                info!("Shutdown signal received, stopping accepting new connections");
+                info!("No longer accepting new connections");
                 break;
             }
         }
@@ -121,8 +131,8 @@ async fn handle_connection(
     disp_tx: mpsc::Sender<DispatcherMessage>,
     peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let (mut ws_sender, mut ws_recv) = ws_stream.split();
-    let (cl_sender, mut cl_recv) = mpsc::channel::<ClientMessage>(CLIENT_CHANNEL_CAPACITY);
+    let (ws_sender, mut ws_recv) = ws_stream.split();
+    let (cl_sender, cl_recv) = mpsc::channel::<ClientMessage>(CLIENT_CHANNEL_CAPACITY);
 
     let first_msg = match ws_recv.next().await {
         Some(Ok(Message::Text(text))) => text,
@@ -148,58 +158,8 @@ async fn handle_connection(
 
     res_chan_rx.await.unwrap()?;
 
-    let disp_tx_send_clone = disp_tx.clone();
-    let client_id_send_clone = client_id.clone();
-    let mut send_task = tokio::spawn(async move {
-        while let Some(cl_msg) = cl_recv.recv().await {
-            let outgoing_msg = match cl_msg {
-                ClientMessage::DirectMessage { from, text } => OutgoingMessage::DirectMessage(OutgoingDirectMessageData { from, text }),
-                ClientMessage::UserList { users } => OutgoingMessage::UserList(OutgoingUserListData { users }),
-                ClientMessage::Shutdown => OutgoingMessage::Shutdown,
-            };
-            
-            let msg_json_str = serde_json::to_string(&outgoing_msg).unwrap();
-            let ws_msg = Message::Text(msg_json_str.into());
-
-            if ws_sender.send(ws_msg).await.is_err() {
-                error!("WebSocket send failed for client {}", client_id_send_clone);
-                // Unregister
-                let unregister_msg = DispatcherMessage::Unregister { id: client_id_send_clone };
-                let _ = disp_tx_send_clone.send(unregister_msg).await;
-                break;
-            }
-        }
-    });
-
-    let disp_tx_recv_clone = disp_tx.clone();
-    let client_id_recv_clone = client_id.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(ws_msg)) = ws_recv.next().await {
-            match ws_msg {
-                Message::Text(text) => match serde_json::from_str::<IncomingMessage>(&text) {
-                    Ok(parsed) => match parsed {
-                        IncomingMessage::DirectMessage(data) => {
-                            let dm_msg = DispatcherMessage::DirectMessage {
-                                from: client_id_recv_clone.clone(),
-                                to: data.to,
-                                text: data.text,
-                            };
-
-                            disp_tx.send(dm_msg).await.unwrap();
-                        }
-                        _ => error!("Unable to handle incoming message {}", &text),
-                    },
-                    _ => error!("Failed to deserialize incoming ws message: {}", &text),
-                },
-                Message::Close(frame) => {
-                    info!("{:?}", frame);
-                    let unregister_msg = DispatcherMessage::Unregister { id: client_id.clone() };
-                    disp_tx_recv_clone.send(unregister_msg).await.unwrap();
-                },
-                m => error!("Unsupported ws message: {:?}", m),
-            }
-        }
-    });
+    let mut send_task = tokio::spawn(cl_recv_handler(ws_sender, cl_recv, disp_tx.clone(), client_id.clone()));
+    let mut recv_task = tokio::spawn(ws_recv_handler(ws_recv, disp_tx.clone(), client_id.clone()));
 
     tokio::select! {
         _ = &mut send_task => {
@@ -212,5 +172,67 @@ async fn handle_connection(
         },
     }
     
+    let _ = disp_tx.send(DispatcherMessage::Unregister { id: client_id }).await;
+    
     Ok(())
+}
+
+async fn cl_recv_handler(
+    mut ws_sender: SplitSink<WebSocketStream<TcpStream>, Message>,
+    mut cl_recv: mpsc::Receiver<ClientMessage>,
+    disp_tx: mpsc::Sender<DispatcherMessage>,
+    client_id: String,
+) {
+    while let Some(cl_msg) = cl_recv.recv().await {
+        let outgoing_msg = match cl_msg {
+            ClientMessage::DirectMessage { from, text } => OutgoingMessage::DirectMessage(OutgoingDirectMessageData { from, text }),
+            ClientMessage::UserList { users } => OutgoingMessage::UserList(OutgoingUserListData { users }),
+            ClientMessage::Shutdown => OutgoingMessage::Shutdown,
+        };
+
+        let msg_json_str = serde_json::to_string(&outgoing_msg).unwrap();
+        let ws_msg = Message::Text(msg_json_str.into());
+
+        if ws_sender.send(ws_msg).await.is_err() {
+            error!("WebSocket send failed for client {}", client_id);
+            let unregister_msg = DispatcherMessage::Unregister { id: client_id.clone() };
+            let _ = disp_tx.send(unregister_msg).await;
+            break;
+        }
+    }
+}
+
+async fn ws_recv_handler(
+    mut ws_recv: SplitStream<WebSocketStream<TcpStream>>,
+    disp_tx: mpsc::Sender<DispatcherMessage>,
+    client_id: String,
+) {
+    while let Some(Ok(ws_msg)) = ws_recv.next().await {
+        match ws_msg {
+            Message::Text(text) => match serde_json::from_str::<IncomingMessage>(&text) {
+                Ok(ws_msg) => match ws_msg {
+                    IncomingMessage::DirectMessage(data) => {
+                        let dm_msg = DispatcherMessage::DirectMessage {
+                            from: client_id.clone(),
+                            to: data.to,
+                            text: data.text,
+                        };
+
+                        if let Err(e) = disp_tx.send(dm_msg).await {
+                            error!("Failed to send message to dispatcher: {}", e);
+                            break;
+                        }
+                    }
+                    _ => error!("Unable to handle incoming message {}", &text),
+                },
+                _ => error!("Failed to deserialize incoming ws message: {}", &text),
+            },
+            Message::Close(_) => {
+                let unregister_msg = DispatcherMessage::Unregister { id: client_id.clone() };
+                let _ = disp_tx.send(unregister_msg).await;
+                break;
+            }
+            m => error!("Unsupported ws message: {:?}", m),
+        }
+    }
 }
