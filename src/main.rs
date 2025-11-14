@@ -12,7 +12,7 @@ use std::{
 use tokio::{
     net::{TcpListener, TcpStream},
     signal,
-    sync::{mpsc, oneshot},
+    sync::mpsc,
 };
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -62,10 +62,12 @@ struct OutgoingDirectMessageData {
     text: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Debug)]
 enum ClientMessage {
     DirectMessage { from: ClientId, text: String },
     UserList { users: Vec<ClientId> },
+    Accept,
+    Reject { reason: String },
     Shutdown,
 }
 
@@ -88,7 +90,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    let (disp_tx, disp_rx) = mpsc::channel(DISPATCHER_CHANNEL_BUFFER_SIZE);
+    let (disp_tx, disp_rx) = mpsc::channel::<DispatcherMessage>(DISPATCHER_CHANNEL_BUFFER_SIZE);
 
     tokio::spawn(Dispatcher::new(disp_rx).run(ct.clone()));
 
@@ -132,7 +134,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (ws_sender, mut ws_recv) = ws_stream.split();
-    let (cl_sender, cl_recv) = mpsc::channel::<ClientMessage>(CLIENT_CHANNEL_CAPACITY);
+    let (cl_sender, mut cl_recv) = mpsc::channel::<ClientMessage>(CLIENT_CHANNEL_CAPACITY);
 
     let first_msg = match ws_recv.next().await {
         Some(Ok(Message::Text(text))) => text,
@@ -147,16 +149,23 @@ async fn handle_connection(
     };
 
     // Register
-    let (res_chan_tx, res_chan_rx) = oneshot::channel();
+    // let (res_chan_tx, res_chan_rx) = oneshot::channel();
     let register_msg = DispatcherMessage::Register {
         id: client_id.clone(),
         tx: cl_sender,
-        res_chan: res_chan_tx,
+        // res_chan: res_chan_tx,
     };
 
     disp_tx.send(register_msg).await?;
 
-    res_chan_rx.await.unwrap()?;
+    match cl_recv.recv().await {
+        Some(ClientMessage::Accept) => {}
+        Some(ClientMessage::Reject { reason: error }) => return Err(error.into()),
+        Some(m) => return Err(format!("Registration failed1 {:?}", m).into()),
+        None => return Err("Registration failed2".into()),
+    }
+
+    // res_chan_rx.await.unwrap()?;
 
     let mut send_task = tokio::spawn(cl_recv_handler(ws_sender, cl_recv, disp_tx.clone(), client_id.clone()));
     let mut recv_task = tokio::spawn(ws_recv_handler(ws_recv, disp_tx.clone(), client_id.clone()));
@@ -171,9 +180,9 @@ async fn handle_connection(
             let _ = send_task.await;
         },
     }
-    
+
     let _ = disp_tx.send(DispatcherMessage::Unregister { id: client_id }).await;
-    
+
     Ok(())
 }
 
@@ -188,6 +197,10 @@ async fn cl_recv_handler(
             ClientMessage::DirectMessage { from, text } => OutgoingMessage::DirectMessage(OutgoingDirectMessageData { from, text }),
             ClientMessage::UserList { users } => OutgoingMessage::UserList(OutgoingUserListData { users }),
             ClientMessage::Shutdown => OutgoingMessage::Shutdown,
+            _ => {
+                error!("Unable to handle client message");
+                continue;
+            }
         };
 
         let msg_json_str = serde_json::to_string(&outgoing_msg).unwrap();

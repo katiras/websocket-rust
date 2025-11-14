@@ -1,5 +1,5 @@
-use std::{collections::HashMap, error::Error};
-use tokio::sync::{mpsc, oneshot};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -11,7 +11,7 @@ pub enum DispatcherMessage {
     Register {
         id: ClientId,
         tx: mpsc::Sender<ClientMessage>,
-        res_chan: oneshot::Sender<Result<(), Box<dyn Error + Send + Sync>>>,
+        // res_chan: oneshot::Sender<Result<(), Box<dyn Error + Send + Sync>>>,
     },
     Unregister {
         id: ClientId,
@@ -54,7 +54,7 @@ impl Dispatcher {
         }
 
         for (id, tx) in self.clients.drain() {
-            info!("Client {} unregistered", id);
+            info!("Client {} removed", id);
             let _ = tx.send(ClientMessage::Shutdown).await;
         }
 
@@ -65,18 +65,35 @@ impl Dispatcher {
 
     async fn handle(&mut self, msg: DispatcherMessage) {
         match msg {
-            DispatcherMessage::Register { id, tx, res_chan } => {
-                let result = match self.clients.contains_key(&id) {
-                    true => Err(format!("Client id {} already exists", id).into()),
+            // DispatcherMessage::Register { id, tx, res_chan } => {
+            //     let result = match self.clients.contains_key(&id) {
+            //         true => Err(format!("Client id {} already exists", id).into()),
+            //         false => {
+            //             self.clients.insert(id.clone(), tx);
+            //             self.broadcast_user_list();
+            //             info!("Client {} registered", id);
+            //             Ok(())
+            //         }
+            //     };
+
+            //     let _ = res_chan.send(result);
+            // }
+            DispatcherMessage::Register { id, tx } => {
+                match self.clients.contains_key(&id) {
+                    true => {
+                        let cl_msg = ClientMessage::Reject {
+                            reason: "Client with same id already exists".to_string(),
+                        };
+
+                        let _ = tx.send(cl_msg).await;
+                    }
                     false => {
-                        self.clients.insert(id.clone(), tx);
+                        self.clients.insert(id.clone(), tx.clone());
+                        let _ = tx.send(ClientMessage::Accept).await;
+                        info!("Client {} accepted", id);
                         self.broadcast_user_list();
-                        info!("Client {} registered", id);
-                        Ok(())
                     }
                 };
-
-                let _ = res_chan.send(result);
             }
             DispatcherMessage::Unregister { id } => {
                 match self.clients.remove(&id) {
@@ -84,7 +101,7 @@ impl Dispatcher {
                         self.broadcast_user_list();
                         info!("Client {} unregistered", id)
                     }
-                    None => {},
+                    None => {}
                 };
             }
             DispatcherMessage::DirectMessage { from, to, text } => match self.clients.get(&to) {
