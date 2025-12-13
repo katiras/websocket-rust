@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::ClientMessage;
+use crate::client::ClientMessage;
 
 pub type ClientId = String;
 
