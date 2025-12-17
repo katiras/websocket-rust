@@ -1,7 +1,7 @@
 use crate::{
     CLIENT_CHANNEL_CAPACITY,
     dispatcher::{ClientId, DispatcherMessage},
-    protocol::{IncomingMessage, OutgoingMessage}, // Assuming ClientMessage is moved to protocol as discussed
+    protocol::{IncomingMessage, OutgoingMessage},
 };
 use futures_util::{
     SinkExt, StreamExt,
@@ -86,11 +86,7 @@ impl Client {
         client_id: String,
     ) {
         while let Some(cl_msg) = cl_rx.recv().await {
-            let outgoing_msg = match cl_msg {
-                ClientMessage::DirectMessage { from, text } => OutgoingMessage::DirectMessage { from, text },
-                ClientMessage::UserList { users } => OutgoingMessage::UserList { users },
-                ClientMessage::Shutdown => OutgoingMessage::Shutdown,
-            };
+            let outgoing_msg: OutgoingMessage = cl_msg.into();
 
             let ws_msg = Message::Text(outgoing_msg.to_json().into());
 
